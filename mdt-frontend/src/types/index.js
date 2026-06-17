@@ -80,3 +80,43 @@ export interface Participant {
 export interface WebRTCConfig {
   iceServers?: RTCIceServer[];
 }
+
+export interface RoomControlState {
+  consultationId: number;
+  roomId: string;
+  presenterId: number;
+  presenterName: string;
+  initiatorId: number;
+  currentPresentationId?: string;
+  currentPageNumber?: number;
+  controlTakenAt?: number;
+}
+
+export interface ControlEvent {
+  eventType:
+    | 'PAGE_FLIP'
+    | 'PRESENTATION_SWITCH'
+    | 'PRESENTER_TRANSFERRED'
+    | 'EXPERT_INVITED'
+    | 'POINTER_MOVE'
+    | 'ANNOTATION_DRAW'
+    | 'CUSTOM';
+  operatorId: number;
+  operatorName: string;
+  timestamp: number;
+  payload: Record<string, any>;
+}
+
+export interface InviteAdditionalExpertsRequest {
+  consultationId: number;
+  operatorId: number;
+  expertIds: number[];
+  urgent: boolean;
+}
+
+export interface TransferPresenterRequest {
+  consultationId: number;
+  fromUserId: number;
+  toUserId: number;
+}
+

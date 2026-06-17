@@ -105,4 +105,53 @@ public class ConsultationController {
         }
         return ResponseEntity.ok(experts);
     }
+
+    @PostMapping("/{id}/invite-experts")
+    public ResponseEntity<ConsultationDetailResponse> inviteAdditionalExperts(
+            @PathVariable Long id,
+            @RequestBody Map<String, Object> body) {
+        Long operatorId = Long.valueOf(body.get("operatorId").toString());
+        @SuppressWarnings("unchecked")
+        List<Long> expertIds = ((List<Object>) body.get("expertIds"))
+                .stream()
+                .map(o -> Long.valueOf(o.toString()))
+                .toList();
+        boolean isUrgent = body.get("urgent") != null && Boolean.TRUE.equals(body.get("urgent"));
+        ConsultationDetailResponse response =
+                consultationService.inviteAdditionalExperts(id, operatorId, expertIds, isUrgent);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{id}/transfer-presenter")
+    public ResponseEntity<Map<String, Object>> transferPresenter(
+            @PathVariable Long id,
+            @RequestBody Map<String, Long> body) {
+        Long fromUserId = body.get("fromUserId");
+        Long toUserId = body.get("toUserId");
+        Map<String, Object> result =
+                consultationService.transferPresenter(id, fromUserId, toUserId);
+        return ResponseEntity.ok(result);
+    }
+
+    @GetMapping("/{id}/control-state")
+    public ResponseEntity<Map<String, Object>> getRoomControlState(@PathVariable Long id) {
+        Map<String, Object> state = consultationService.getRoomControlState(id);
+        return ResponseEntity.ok(state);
+    }
+
+    @PostMapping("/{id}/control-event")
+    public ResponseEntity<Map<String, Object>> broadcastControlEvent(
+            @PathVariable Long id,
+            @RequestBody Map<String, Object> body) {
+        Long operatorId = Long.valueOf(body.get("operatorId").toString());
+        String eventType = body.get("eventType") != null ? body.get("eventType").toString() : "UNKNOWN";
+        @SuppressWarnings("unchecked")
+        Map<String, Object> payload =
+                body.get("payload") instanceof Map
+                        ? (Map<String, Object>) body.get("payload")
+                        : Map.of();
+        Object event = consultationService.broadcastControlEvent(id, operatorId, eventType, payload);
+        Map<String, Object> result = Map.of("success", true, "event", event);
+        return ResponseEntity.ok(result);
+    }
 }

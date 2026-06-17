@@ -12,6 +12,9 @@ import {
   message,
   Modal,
   Tooltip,
+  Row,
+  Col,
+  Divider,
 } from 'antd'
 import {
   VideoCameraOutlined,
@@ -26,14 +29,21 @@ import {
   InfoCircleOutlined,
   FullscreenOutlined,
   PhoneFilled,
+  PhoneOutlined,
+  SwapOutlined,
+  CrownOutlined,
+  WarningOutlined,
 } from '@ant-design/icons'
 import VideoPlayer from '../components/VideoPlayer'
+import UrgentInviteModal from '../components/UrgentInviteModal'
+import TransferRoleModal from '../components/TransferRoleModal'
 import { consultationApi } from '../services/api'
 import wsService from '../services/websocket'
 import useWebRTC from '../hooks/useWebRTC'
+import { usePresenterControl } from '../hooks/usePresenterControl'
 import dayjs from 'dayjs'
 
-const { Title, Text } = Typography
+const { Title, Text, Paragraph } = Typography
 
 function ConsultationRoomPage() {
   const { id } = useParams()
@@ -44,6 +54,9 @@ function ConsultationRoomPage() {
   const [expertDrawerVisible, setExpertDrawerVisible] = useState(false)
   const [joined, setJoined] = useState(false)
   const [isInitiator, setIsInitiator] = useState(false)
+
+  const [urgentInviteOpen, setUrgentInviteOpen] = useState(false)
+  const [transferRoleOpen, setTransferRoleOpen] = useState(false)
 
   const userId = Number(searchParams.get('userId') || localStorage.getItem('userId') || 1)
   const userName = searchParams.get('userName') || localStorage.getItem('userName') || '医生'
@@ -62,6 +75,22 @@ function ConsultationRoomPage() {
     handleIceCandidate,
     createOffer,
   } = useWebRTC(consultation?.roomId, userId, userName)
+
+  const {
+    presenterId,
+    presenterName,
+    initiatorId,
+    currentPage,
+    currentPresentationId,
+    isPresenter,
+    hasControl,
+    flipPage,
+    switchPresentation,
+    loadControlState,
+    setPresenterId,
+    setPresenterName,
+  } = usePresenterControl(
+    consultation?.id, userId, userName, consultation?.roomId)
 
   const remoteStreamsRef = useRef(remoteStreams)
   useEffect(() => {
@@ -117,9 +146,11 @@ function ConsultationRoomPage() {
         loadConsultationDetail()
       })
 
-      wsService.subscribeToRoom(consultation?.roomId, (message) => {
-        handleRoomMessage(message)
-      })
+      if (consultation?.roomId) {
+        wsService.subscribeToRoom(consultation.roomId, (msg) => {
+          handleRoomMessage(msg)
+        })
+      }
     } catch (error) {
       console.error('WebSocket 连接失败:', error)
     }
@@ -132,12 +163,14 @@ function ConsultationRoomPage() {
       case 'OFFER':
         if (message.toUserId === userId && message.fromUserId !== userId) {
           const answer = await handleOffer(message.fromUserId, message.offer)
-          wsService.send(`/topic/room/${consultation.roomId}`, {
-            type: 'ANSWER',
-            fromUserId: userId,
-            toUserId: message.fromUserId,
-            answer,
-          })
+          if (consultation?.roomId) {
+            wsService.send(`/topic/room/${consultation.roomId}`, {
+              type: 'ANSWER',
+              fromUserId: userId,
+              toUserId: message.fromUserId,
+              answer,
+            })
+          }
         }
         break
 
@@ -159,6 +192,34 @@ function ConsultationRoomPage() {
         }
         break
 
+      case 'EXPERT_INVITED':
+        message.success(
+          `${message.userName || '新专家'} 已被邀请加入会诊`
+        )
+        loadConsultationDetail()
+        break
+
+      case 'PRESENTER_TRANSFERRED':
+        setPresenterId(message.toUserId)
+        setPresenterName(message.toUserName)
+        if (message.toUserId === userId) {
+          message.success('您已成为主讲人，可以控制课件和翻页')
+        } else {
+          message.info(`主讲人已变更为：${message.toUserName}`)
+        }
+        break
+
+      case 'CONTROL_EVENT':
+        if (message.event) {
+          const event = message.event
+          if (event.eventType === 'PAGE_FLIP') {
+            message.info(
+              `${event.operatorName} 翻到第 ${event.payload?.pageNumber} 页`
+            )
+          }
+        }
+        break
+
       default:
         break
     }
@@ -168,12 +229,14 @@ function ConsultationRoomPage() {
     console.log('连接到新用户:', remoteUserId, remoteUserName)
     try {
       const offer = await createOffer(remoteUserId)
-      wsService.send(`/topic/room/${consultation.roomId}`, {
-        type: 'OFFER',
-        fromUserId: userId,
-        toUserId: remoteUserId,
-        offer,
-      })
+      if (consultation?.roomId) {
+        wsService.send(`/topic/room/${consultation.roomId}`, {
+          type: 'OFFER',
+          fromUserId: userId,
+          toUserId: remoteUserId,
+          offer,
+        })
+      }
     } catch (error) {
       console.error('创建 offer 失败:', error)
     }
@@ -195,7 +258,7 @@ function ConsultationRoomPage() {
         }
       }
 
-      if (wsService.isConnected()) {
+      if (wsService.isConnected() && consultation?.roomId) {
         wsService.send(`/topic/room/${consultation.roomId}`, {
           type: 'USER_JOINED',
           userId,
@@ -251,6 +314,10 @@ function ConsultationRoomPage() {
     })
   }
 
+  const handleUrgentInvited = () => {
+    loadConsultationDetail()
+  }
+
   const getStatusConfig = (status) => {
     const map = {
       PENDING: { color: 'blue', text: '待开始' },
@@ -292,7 +359,8 @@ function ConsultationRoomPage() {
         userName: `${userName}（我）`,
         stream: localStream,
         isLocal: true,
-        role: isInitiator ? '主持人' : '专家',
+        role: isPresenter ? '主讲人' : isInitiator ? '主持人' : '专家',
+        isPresenter,
       })
     }
 
@@ -302,7 +370,8 @@ function ConsultationRoomPage() {
         userName: remote.userName,
         stream: remote.stream,
         isLocal: false,
-        role: '专家',
+        role: presenterId === remote.userId ? '主讲人' : '专家',
+        isPresenter: presenterId === remote.userId,
       })
     })
 
@@ -314,7 +383,8 @@ function ConsultationRoomPage() {
             userName: exp.expertName,
             stream: null,
             isLocal: false,
-            role: '专家',
+            role: presenterId === exp.expertId ? '主讲人' : '专家',
+            isPresenter: presenterId === exp.expertId,
             status: exp.status,
           })
         }
@@ -371,11 +441,37 @@ function ConsultationRoomPage() {
               <Text style={{ color: '#999', fontSize: 12 }}>
                 {consultation?.consultationNo}
               </Text>
+              {presenterName && (
+                <Tag color="gold" icon={<CrownOutlined />}>
+                  主讲：{presenterName}
+                </Tag>
+              )}
             </Space>
           </div>
         </Space>
 
         <Space size="middle">
+          {consultation?.status === 'IN_PROGRESS' && (
+            <Space size="middle">
+              <Tooltip title="紧急呼叫外部专家">
+                <Button
+                  danger
+                  icon={<PhoneOutlined />}
+                  onClick={() => setUrgentInviteOpen(true)}
+                >
+                  紧急呼叫
+                </Button>
+              </Tooltip>
+              {hasControl && consultation?.experts?.length > 1 && (
+                <Tooltip title="移交主讲人权限">
+                  <Button icon={<SwapOutlined />} onClick={() => setTransferRoleOpen(true)}>
+                    移交主讲人
+                  </Button>
+                </Tooltip>
+              )}
+            </Space>
+          )}
+
           <Badge count={videos.length} title="在线人数">
             <Button
               type="text"
@@ -432,26 +528,27 @@ function ConsultationRoomPage() {
                   gridColumn: '1 / -1',
                 }}
               >
-                <div style={{ textAlign: 'center' }}>
-                  <UserOutlined style={{ fontSize: 64, marginBottom: 16 }} />
-                  <div>暂无参与者加入</div>
+                  <div style={{ textAlign: 'center' }}>
+                    <UserOutlined style={{ fontSize: 64, marginBottom: 16 }} />
+                    <div>暂无参与者加入</div>
+                  </div>
                 </div>
-              </div>
-            ) : (
-              videos.map((video, index) => (
-                <div key={video.userId} className={index === 0 ? 'main-video' : ''}>
-                  <VideoPlayer
-                    stream={video.stream}
-                    name={video.userName}
-                    role={video.role}
-                    muted={video.isLocal}
-                    isLocal={video.isLocal}
-                  />
-                </div>
-              ))
-            )}
-          </div>
-        )}
+              ) : (
+                videos.map((video, index) => (
+                  <div key={video.userId} className={index === 0 ? 'main-video' : ''}>
+                    <VideoPlayer
+                      stream={video.stream}
+                      name={video.userName}
+                      role={video.role}
+                      muted={video.isLocal}
+                      isLocal={video.isLocal}
+                      isPresenter={video.isPresenter}
+                    />
+                  </div>
+                ))
+              )}
+            </div>
+          )}
       </div>
 
       {joined && (
@@ -490,6 +587,16 @@ function ConsultationRoomPage() {
             </Tooltip>
           )}
 
+          <Tooltip title="紧急呼叫">
+            <button
+              className="control-btn"
+              style={{ background: hasControl ? '#ff4d4f' : '#333', color: '#fff' }}
+              onClick={() => setUrgentInviteOpen(true)}
+            >
+              <WarningOutlined />
+            </button>
+          </Tooltip>
+
           <Tooltip title="参与者列表">
             <button
               className="control-btn"
@@ -520,26 +627,72 @@ function ConsultationRoomPage() {
       >
         <List
           dataSource={consultation?.experts || []}
-          renderItem={(expert) => (
-            <List.Item key={expert.expertId}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%' }}>
-                <Avatar
-                  size={40}
-                  style={{ backgroundColor: '#1890ff' }}
-                  icon={<UserOutlined />}
-                />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 500 }}>{expert.expertName}</div>
-                  <div style={{ fontSize: 12, color: '#999' }}>{expert.departmentName}</div>
+          renderItem={(expert) => {
+            const isCurrentPresenter = expert.expertId === presenterId
+            return (
+              <List.Item key={expert.expertId}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%' }}>
+                  <Avatar
+                    size={40}
+                    style={{ backgroundColor: isCurrentPresenter ? '#ffd700' : '#1890ff' }}
+                    icon={<UserOutlined />}
+                  />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 500 }}>
+                      {expert.expertName}
+                      {expert.expertId === userId && <Tag color="blue" style={{ marginLeft: 8 }}>我</Tag>}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#999' }}>{expert.departmentName}</div>
+                  </div>
+                  <Space direction="vertical" align="end" size={4}>
+                    {isCurrentPresenter && (
+                      <Tag color="gold" icon={<CrownOutlined />}>
+                        主讲人
+                      </Tag>
+                    )}
+                    <Tag color={getExpertStatusColor(expert.status)}>
+                      {getExpertStatusText(expert.status)}
+                    </Tag>
+                  </Space>
+                  {hasControl && !isCurrentPresenter && expert.status !== 'DECLINED' && (
+                      <Button
+                      type="link"
+                      size="small"
+                      icon={<SwapOutlined />}
+                      onClick={() => {
+                        setTransferRoleOpen(true)
+                      }}
+                    >
+                      移交
+                    </Button>
+                  )}
                 </div>
-                <Tag color={getExpertStatusColor(expert.status)}>
-                  {getExpertStatusText(expert.status)}
-                </Tag>
-              </div>
-            </List.Item>
-          )}
+              </List.Item>
+            )
+          }}
         />
       </Drawer>
+
+      <UrgentInviteModal
+        open={urgentInviteOpen}
+        onClose={() => setUrgentInviteOpen(false)}
+        consultationId={consultation?.id}
+        operatorId={userId}
+        onInvited={handleUrgentInvited}
+      />
+
+      <TransferRoleModal
+        open={transferRoleOpen}
+        onClose={() => setTransferRoleOpen(false)}
+        consultationId={consultation?.id}
+        currentUserId={userId}
+        currentPresenterId={presenterId}
+        participants={consultation?.experts || []}
+        onTransferred={(targetId, targetName) => {
+          setPresenterId(targetId)
+          setPresenterName(targetName)
+        }}
+      />
     </div>
   )
 }

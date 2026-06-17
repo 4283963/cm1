@@ -6,6 +6,7 @@ import com.mdt.dto.CreateConsultationRequest;
 import com.mdt.entity.*;
 import com.mdt.redis.DistributedLock;
 import com.mdt.redis.ParticipantInfo;
+import com.mdt.redis.RoomRouteInfo;
 import com.mdt.redis.RoomRouteService;
 import com.mdt.repository.ConsultationExpertRepository;
 import com.mdt.repository.ConsultationRepository;
@@ -119,13 +120,14 @@ public class ConsultationService {
             consultationExperts = saveExpertsIdempotently(consultation.getId(), consultationExperts);
         }
 
-        roomRouteService.createRoom(roomId, consultation.getId(), consultationNo);
+        roomRouteService.createRoom(roomId, consultation.getId(), consultationNo,
+                request.getInitiatorId(), request.getInitiatorName());
 
         ParticipantInfo initiatorInfo = new ParticipantInfo();
         initiatorInfo.setUserId(request.getInitiatorId());
         initiatorInfo.setUserName(request.getInitiatorName());
         initiatorInfo.setRole("INITIATOR");
-        initiatorInfo.setStatus("INVITED");
+        initiatorInfo.setStatus("JOINED");
         roomRouteService.addParticipantIfAbsent(roomId, initiatorInfo);
         roomRouteService.setUserRoute(request.getInitiatorId().toString(), roomId);
 
@@ -457,6 +459,213 @@ public class ConsultationService {
 
     public List<Expert> getExpertsByDepartments(List<Long> departmentIds) {
         return expertRepository.findByDepartmentIdIn(departmentIds);
+    }
+
+    private static final String LOCK_INVITE_ADDITIONAL = "invite_additional:%d";
+    private static final String LOCK_TRANSFER_PRESENTER = "transfer_presenter:%d";
+    private static final String LOCK_CONTROL_EVENT = "control_event:%s";
+
+    public ConsultationDetailResponse inviteAdditionalExperts(Long consultationId,
+                                                              Long operatorId,
+                                                              List<Long> newExpertIds,
+                                                              boolean isUrgent) {
+        String lockKey = String.format(LOCK_INVITE_ADDITIONAL, consultationId);
+        return distributedLock.executeWithLock(lockKey, LOCK_LEASE_MS,
+                () -> doInviteAdditionalExperts(consultationId, operatorId, newExpertIds, isUrgent));
+    }
+
+    @Transactional
+    protected ConsultationDetailResponse doInviteAdditionalExperts(Long consultationId,
+                                                                    Long operatorId,
+                                                                    List<Long> newExpertIds,
+                                                                    boolean isUrgent) {
+        log.info("会诊中追加专家邀请: consultationId={}, operatorId={}, newExpertIds={}, urgent={}",
+                consultationId, operatorId, newExpertIds, isUrgent);
+
+        if (newExpertIds == null || newExpertIds.isEmpty()) {
+            throw new RuntimeException("请至少选择一位要邀请的专家");
+        }
+
+        Consultation consultation = consultationRepository.findById(consultationId)
+                .orElseThrow(() -> new RuntimeException("会诊不存在"));
+
+        if (ConsultationStatus.COMPLETED.equals(consultation.getStatus())
+                || ConsultationStatus.CANCELLED.equals(consultation.getStatus())) {
+            throw new RuntimeException("会诊已结束，无法追加邀请");
+        }
+
+        List<ConsultationExpert> existingList =
+                consultationExpertRepository.findByConsultationId(consultationId);
+        Set<Long> existingExpertIds = existingList.stream()
+                .map(ConsultationExpert::getExpertId)
+                .collect(Collectors.toSet());
+
+        List<Long> filteredIds = newExpertIds.stream()
+                .filter(id -> !existingExpertIds.contains(id))
+                .distinct()
+                .collect(Collectors.toList());
+
+        if (filteredIds.isEmpty()) {
+            log.info("要邀请的专家均已在会诊中，幂等直接返回");
+            return buildDetailResponse(consultation, existingList);
+        }
+
+        List<Expert> newExperts = expertRepository.findAllById(filteredIds);
+        Map<Long, String> deptNameMap = new HashMap<>();
+        for (Expert expert : newExperts) {
+            deptNameMap.computeIfAbsent(expert.getDepartmentId(), k ->
+                    departmentRepository.findById(k).map(Department::getName).orElse("")
+            );
+        }
+
+        List<ConsultationExpert> newConsultationExperts = new ArrayList<>();
+        for (Expert expert : newExperts) {
+            ConsultationExpert ce = new ConsultationExpert();
+            ce.setConsultationId(consultationId);
+            ce.setExpertId(expert.getId());
+            ce.setExpertName(expert.getName());
+            ce.setDepartmentName(deptNameMap.getOrDefault(expert.getDepartmentId(), ""));
+            ce.setStatus(ConsultationExpertStatus.INVITED);
+            newConsultationExperts.add(ce);
+        }
+        consultationExpertRepository.saveAll(newConsultationExperts);
+
+        ParticipantInfo operator = roomRouteService.getParticipants(consultation.getRoomId())
+                .get(operatorId);
+        String operatorName = operator != null ? operator.getUserName()
+                : (consultation.getInitiatorId().equals(operatorId) ? consultation.getInitiatorName() : "专家");
+
+        for (Expert expert : newExperts) {
+            ParticipantInfo pi = new ParticipantInfo();
+            pi.setUserId(expert.getId());
+            pi.setUserName(expert.getName());
+            pi.setDepartmentName(deptNameMap.getOrDefault(expert.getDepartmentId(), ""));
+            pi.setRole("EXPERT");
+            pi.setStatus("INVITED");
+            roomRouteService.addParticipantIfAbsent(consultation.getRoomId(), pi);
+
+            ConsultationNotification notification = new ConsultationNotification();
+            notification.setType(isUrgent ? "URGENT_INVITE" : "INVITE");
+            notification.setConsultationId(consultationId);
+            notification.setConsultationNo(consultation.getConsultationNo());
+            notification.setTitle(consultation.getTitle());
+            notification.setInitiatorName(operatorName);
+            notification.setPatientName(consultation.getPatientName());
+            notification.setRoomId(consultation.getRoomId());
+            notification.setCreatedAt(consultation.getCreatedAt());
+            notification.setMessage(isUrgent
+                    ? String.format("【紧急呼叫】%s 在会诊中紧急邀请您加入，请立即处理！", operatorName)
+                    : String.format("%s 在会诊中追加邀请您加入", operatorName));
+
+            notificationService.sendConsultationInvite(expert.getId(), notification);
+
+            Map<String, Object> roomMsg = new HashMap<>();
+            roomMsg.put("type", "EXPERT_INVITED");
+            roomMsg.put("urgent", isUrgent);
+            roomMsg.put("expertId", expert.getId());
+            roomMsg.put("expertName", expert.getName());
+            roomMsg.put("departmentName", deptNameMap.getOrDefault(expert.getDepartmentId(), ""));
+            roomMsg.put("operatorId", operatorId);
+            roomMsg.put("operatorName", operatorName);
+            notificationService.sendRoomBroadcast(consultation.getRoomId(), roomMsg);
+
+            log.info("已向专家 {}({}) 发送{}会诊邀请", expert.getName(), expert.getId(),
+                    isUrgent ? "紧急" : "追加");
+        }
+
+        List<ConsultationExpert> allExperts =
+                consultationExpertRepository.findByConsultationId(consultationId);
+        return buildDetailResponse(consultation, allExperts);
+    }
+
+    public Map<String, Object> transferPresenter(Long consultationId,
+                                                  Long fromUserId,
+                                                  Long toUserId) {
+        String lockKey = String.format(LOCK_TRANSFER_PRESENTER, consultationId);
+        return distributedLock.executeWithLock(lockKey, LOCK_LEASE_MS,
+                () -> doTransferPresenter(consultationId, fromUserId, toUserId));
+    }
+
+    @Transactional
+    protected Map<String, Object> doTransferPresenter(Long consultationId,
+                                                       Long fromUserId,
+                                                       Long toUserId) {
+        log.info("移交主讲人权限: consultationId={}, from={}, to={}",
+                consultationId, fromUserId, toUserId);
+
+        Consultation consultation = consultationRepository.findById(consultationId)
+                .orElseThrow(() -> new RuntimeException("会诊不存在"));
+
+        ConsultationExpert toExpert = consultationExpertRepository
+                .findByConsultationIdAndExpertId(consultationId, toUserId)
+                .orElseThrow(() -> new RuntimeException("目标专家未参与本次会诊"));
+
+        if (!ConsultationExpertStatus.ACCEPTED.equals(toExpert.getStatus())
+                && !ConsultationExpertStatus.JOINED.equals(toExpert.getStatus())) {
+            throw new RuntimeException("目标专家尚未加入会诊，无法移交控制权");
+        }
+
+        boolean success = roomRouteService.transferPresenter(
+                consultation.getRoomId(), fromUserId, toUserId, toExpert.getExpertName());
+
+        if (!success) {
+            throw new RuntimeException("移交控制权失败：您没有权限或目标专家不在房间中");
+        }
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("fromUserId", fromUserId);
+        payload.put("toUserId", toUserId);
+        payload.put("toUserName", toExpert.getExpertName());
+        payload.put("consultationId", consultationId);
+
+        notificationService.sendRoomBroadcast(consultation.getRoomId(), payload);
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("success", true);
+        result.put("presenterId", toUserId);
+        result.put("presenterName", toExpert.getExpertName());
+        result.put("consultationId", consultationId);
+        return result;
+    }
+
+    public Map<String, Object> getRoomControlState(Long consultationId) {
+        Consultation consultation = consultationRepository.findById(consultationId)
+                .orElseThrow(() -> new RuntimeException("会诊不存在"));
+        RoomRouteInfo roomInfo = roomRouteService.getRoom(consultation.getRoomId());
+
+        Map<String, Object> state = new HashMap<>();
+        state.put("consultationId", consultationId);
+        state.put("roomId", consultation.getRoomId());
+        if (roomInfo != null) {
+            state.put("presenterId", roomInfo.getPresenterId());
+            state.put("presenterName", roomInfo.getPresenterName());
+            state.put("initiatorId", roomInfo.getInitiatorId());
+            state.put("currentPresentationId", roomInfo.getCurrentPresentationId());
+            state.put("currentPageNumber", roomInfo.getCurrentPageNumber());
+            state.put("controlTakenAt", roomInfo.getControlTakenAt());
+        }
+        return state;
+    }
+
+    public RoomRouteInfo.ControlEvent broadcastControlEvent(Long consultationId,
+                                                             Long operatorId,
+                                                             String eventType,
+                                                             Map<String, Object> payload) {
+        Consultation consultation = consultationRepository.findById(consultationId)
+                .orElseThrow(() -> new RuntimeException("会诊不存在"));
+
+        RoomRouteInfo.ControlEvent event = roomRouteService.recordControlEvent(
+                consultation.getRoomId(), operatorId, eventType, payload);
+
+        if (event != null) {
+            Map<String, Object> wsMsg = new HashMap<>();
+            wsMsg.put("type", "CONTROL_EVENT");
+            wsMsg.put("event", event);
+            notificationService.sendRoomBroadcast(consultation.getRoomId(), wsMsg);
+        } else {
+            throw new RuntimeException("您没有控制权，无法执行该操作");
+        }
+        return event;
     }
 
     private String generateConsultationNo() {

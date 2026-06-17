@@ -51,6 +51,29 @@ export const consultationApi = {
 
   getExperts: (params) =>
     request.get('/consultation/experts', { params }),
+
+  inviteAdditionalExperts: (consultationId, operatorId, expertIds, urgent = false) =>
+    request.post(`/consultation/${consultationId}/invite-experts`, {
+      operatorId,
+      expertIds,
+      urgent,
+    }),
+
+  transferPresenter: (consultationId, fromUserId, toUserId) =>
+    request.post(`/consultation/${consultationId}/transfer-presenter`, {
+      fromUserId,
+      toUserId,
+    }),
+
+  getControlState: (consultationId) =>
+    request.get(`/consultation/${consultationId}/control-state`),
+
+  broadcastControlEvent: (consultationId, operatorId, eventType, payload = {}) =>
+    request.post(`/consultation/${consultationId}/control-event`, {
+      operatorId,
+      eventType,
+      payload,
+    }),
 }
 
 export default request
