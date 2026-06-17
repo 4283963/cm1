@@ -8,12 +8,19 @@ import java.time.LocalDateTime;
 
 @Data
 @Entity
-@Table(name = "mdt_consultation_expert")
+@Table(name = "mdt_consultation_expert",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_consultation_expert",
+                columnNames = {"consultation_id", "expert_id"}
+        ))
 public class ConsultationExpert {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Version
+    private Long version;
 
     @Column(name = "consultation_id", nullable = false)
     private Long consultationId;
